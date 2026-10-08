@@ -1,4 +1,18 @@
-"""Validate the rubric's plain-text format; never trust model arithmetic."""
+"""Validate and normalize essay-checking results.
+
+The model is trusted only for:
+- the 12 individual criterion scores;
+- the five recommendations;
+- the final teacher conclusion.
+
+Python is authoritative for:
+- /24 total;
+- /75 conversion;
+- final output formatting.
+
+Small formatting differences from the model must not turn a valid
+evaluation into a technical failure.
+"""
 
 import re
 from decimal import Decimal
@@ -25,8 +39,8 @@ CRITERIA = (
     "Nutq sofligi",
 )
 
-# Literal transcription of the supplied matrix,
-# indexed by half-point units.
+# Fixed UZBMB conversion matrix.
+# Index = score * 2.
 SCALE = (
     0,
     28,
@@ -80,229 +94,480 @@ SCALE = (
 )
 
 STOP_SCORES = {
-    "mavzuga mos emas": 2,
-    "100 so‘zdan kam": 2,
-    "ko‘chirilgan": 2,
-    "esse yo‘q": 0,
-    "faqat kirish": 0,
-    "to‘liq kirill": 0,
+    "mavzuga mos emas": Decimal("2"),
+    "100 so‘zdan kam": Decimal("2"),
+    "ko‘chirilgan": Decimal("2"),
+    "esse yo‘q": Decimal("0"),
+    "faqat kirish": Decimal("0"),
+    "to‘liq kirill": Decimal("0"),
 }
 
 RECOMMENDATIONS = "BALLNI OSHIRISH UCHUN TAVSIYALAR (5 ta):"
 CONCLUSION = "UMUMIY XULOSA:"
 
+ALLOWED_SCORES = {
+    Decimal("0"),
+    Decimal("0.5"),
+    Decimal("1"),
+    Decimal("1.5"),
+    Decimal("2"),
+}
+
 
 def scale_score(score) -> int:
-    """
-    Convert the authoritative /24 score to /75
-    using the fixed lookup matrix only.
-    """
-    units = Decimal(str(score)) * 2
+    """Convert /24 score to /75 using only the official fixed matrix."""
+    score = Decimal(str(score))
+    units = score * 2
 
-    if units != units.to_integral_value() or not 0 <= units <= 48:
-        raise ValueError("Invalid total")
+    if units != units.to_integral_value():
+        raise ValueError(f"invalid_half_point_total:{score}")
+
+    if units < 0 or units > 48:
+        raise ValueError(f"total_out_of_range:{score}")
 
     return SCALE[int(units)]
 
 
 def totals(score) -> str:
-    """
-    Build authoritative totals.
+    """Generate totals ourselves instead of trusting model arithmetic."""
+    score = Decimal(str(score))
 
-    IMPORTANT:
-    These values are calculated by Python,
-    not trusted from the model response.
-    """
     return (
         f"Jami ball: {score:g} / 24\n\n"
         f"75 ballik shkala bo‘yicha: {scale_score(score)} / 75"
     )
 
 
-def validate_result(text: str, essay: str) -> str:
-    """
-    Validate the model's output structure.
+def _clean_model_text(text: str) -> str:
+    """Remove harmless formatting differences produced by models."""
+    if not isinstance(text, str):
+        raise ValueError("result_not_string")
 
-    The model decides the individual 12 criterion scores,
-    recommendations, and conclusion.
-
-    Python is authoritative for:
-    - summing the 12 criterion scores;
-    - calculating the /24 total;
-    - converting to the /75 scale.
-
-    Model-generated arithmetic is intentionally ignored.
-    """
-
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ")
     text = text.strip()
 
-    if not text.startswith(INTRO):
-        raise ValueError("Invalid result intro")
+    # Remove surrounding Markdown code fence if a model added one.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:text|plaintext)?\s*", "", text, count=1)
+        text = re.sub(r"\s*```$", "", text, count=1)
 
-    if "MATN BO‘YICHA IZOHLAR" in text:
-        raise ValueError("Forbidden result section")
+    # Telegram output is plain text anyway.
+    # Remove accidental Markdown emphasis.
+    text = text.replace("**", "").replace("__", "")
 
-    body = text[len(INTRO):].strip()
+    # Remove Markdown heading prefixes such as ### BAHOLASH NATIJALARI:
+    text = re.sub(r"(?m)^\s*#{1,6}\s*", "", text)
 
-    # We still require the model to follow the expected output format,
-    # but the numerical totals it prints are NOT trusted.
-    total_pattern = (
-        r"Jami ball: ([0-9]+(?:\.5)?) / 24\s+"
-        r"75 ballik shkala bo‘yicha: ([0-9]+) / 75"
+    # Avoid excessive model-generated blank space.
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+
+    return text.strip()
+
+
+def _normalize_label(value: str) -> str:
+    """Normalize harmless Unicode differences in criterion names."""
+    value = value.strip()
+
+    # Uzbek apostrophe variants.
+    value = value.translate(
+        str.maketrans(
+            {
+                "ʻ": "‘",
+                "ʼ": "‘",
+                "’": "‘",
+                "`": "‘",
+                "´": "‘",
+            }
+        )
     )
 
-    # ---------------------------------------------------------
-    # STOP RESULT
-    # ---------------------------------------------------------
+    # Dash variants.
+    value = re.sub(r"[‐-‒–—−]", "-", value)
 
-    if body.startswith("STOP NATIJA:"):
-        match = re.fullmatch(
-            r"STOP NATIJA:\s+"
-            r"Sabab: ([^\n]+)\s+"
-            + total_pattern,
-            body,
-        )
+    # Ignore spacing around internal dashes.
+    value = re.sub(r"\s*-\s*", "-", value)
 
-        if not match:
-            raise ValueError("Invalid STOP result")
+    value = re.sub(r"\s+", " ", value)
 
-        reason = match[1].strip()
+    return value.casefold().strip()
 
-        if reason not in STOP_SCORES:
-            raise ValueError("Invalid STOP reason")
 
-        # Authoritative score comes from our own rules.
-        score = STOP_SCORES[reason]
+CRITERION_LOOKUP = {
+    _normalize_label(name): name
+    for name in CRITERIA
+}
 
-        # IMPORTANT:
-        # Do NOT validate model arithmetic here.
-        #
-        # Even if the model writes the wrong /24 or /75 value,
-        # reconstruct the correct values ourselves.
-        return (
-            INTRO
-            + "\n\nSTOP NATIJA:\n\n"
-            + "Sabab: "
-            + reason
-            + "\n\n"
-            + totals(score)
-        )
+# Safe aliases in case a model uses the rubric heading instead
+# of the required final-output label.
+CRITERION_ALIASES = {
+    _normalize_label("Qarashlar va shaxsiy fikr yoritilishi"):
+        "Qarashlar va shaxsiy fikr",
 
-    # ---------------------------------------------------------
-    # SHORT ESSAY SAFETY CHECK
-    # ---------------------------------------------------------
+    _normalize_label("So‘z qo‘llash bilan bog‘liq uslubiy xatolik"):
+        "So‘z qo‘llash uslubiyati",
 
-    if len(essay.split()) < 100:
-        raise ValueError("Short essay requires official STOP result")
+    _normalize_label("Leksik xilma-xillik"):
+        "Leksik boylik",
+}
 
-    # ---------------------------------------------------------
-    # NORMAL 12-CRITERIA RESULT
-    # ---------------------------------------------------------
 
-    pattern = r"BAHOLASH NATIJALARI:\s+"
+def _criterion_name(value: str) -> str | None:
+    key = _normalize_label(value)
 
-    for name in CRITERIA:
-        pattern += (
-            re.escape(name)
-            + r" — (0|0\.5|1|1\.5|2)\s+"
-        )
+    if key in CRITERION_LOOKUP:
+        return CRITERION_LOOKUP[key]
 
-    pattern += (
-        total_pattern
-        + r"\s+"
-        + re.escape(RECOMMENDATIONS)
-        + r"\s+(.+?)\s+"
-        + re.escape(CONCLUSION)
-        + r"\s+(.+)"
+    return CRITERION_ALIASES.get(key)
+
+
+def _validate_intro(text: str) -> None:
+    """Require the expected teacher identity without being punctuation-fragile."""
+    if not re.match(r"^Assalomu alaykum[.!]?", text):
+        raise ValueError("invalid_result_intro")
+
+    intro_area = text[:500]
+
+    if (
+        "Sizning essengiz Sardor Toshmuhammadov tomonidan"
+        not in intro_area
+    ):
+        raise ValueError("missing_teacher_intro")
+
+
+def _parse_stop(text: str) -> str | None:
+    """Return normalized STOP result, or None if this is not a STOP answer."""
+    if "STOP NATIJA:" not in text:
+        return None
+
+    if "BAHOLASH NATIJALARI:" in text:
+        raise ValueError("conflicting_stop_and_normal_result")
+
+    match = re.search(
+        r"STOP NATIJA:\s*"
+        r"(?:\n\s*)*"
+        r"Sabab:\s*([^\n]+)",
+        text,
+        re.IGNORECASE,
     )
-
-    match = re.fullmatch(pattern, body, re.S)
 
     if not match:
-        raise ValueError("Malformed rubric result")
+        raise ValueError("stop_reason_missing")
 
-    # Criterion scores are the only numerical grading values
-    # we trust from the model.
-    scores = [
-        Decimal(match[i])
-        for i in range(1, 13)
+    reason = match.group(1).strip()
+
+    # Remove punctuation accidentally added after the reason.
+    reason = reason.rstrip(". ")
+
+    if reason not in STOP_SCORES:
+        raise ValueError(f"invalid_stop_reason:{reason[:80]}")
+
+    score = STOP_SCORES[reason]
+
+    return (
+        INTRO
+        + "\n\nSTOP NATIJA:\n\n"
+        + f"Sabab: {reason}"
+        + "\n\n"
+        + totals(score)
+    )
+
+
+def _parse_scores(score_block: str) -> dict[str, Decimal]:
+    """Parse the 12 criterion scores without trusting model totals."""
+    parsed: dict[str, Decimal] = {}
+
+    # Criterion lines end with one allowed score.
+    #
+    # Accepted examples:
+    #
+    # Publitsistik uslub — 2
+    # Publitsistik uslub - 2
+    # Publitsistik uslub: 2
+    # Publitsistik uslub — 2.0
+    #
+    score_line = re.compile(
+        r"^\s*"
+        r"(?P<name>.+?)"
+        r"\s+(?:—|–|-|:)\s*"
+        r"(?P<score>0(?:\.0|\.5)?|1(?:\.0|\.5)?|2(?:\.0)?)"
+        r"\s*$"
+    )
+
+    for raw_line in score_block.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        # Ignore model-generated totals completely.
+        lower = line.casefold()
+
+        if lower.startswith("jami ball"):
+            continue
+
+        if lower.startswith("75 ballik shkala"):
+            continue
+
+        # Ignore accidental list bullet before a criterion.
+        line = re.sub(r"^[•*]\s*", "", line)
+
+        match = score_line.match(line)
+
+        if not match:
+            # If it looks like a criterion/score line but is malformed,
+            # make the DB diagnostic useful.
+            if any(
+                _normalize_label(name) in _normalize_label(line)
+                for name in CRITERIA
+            ):
+                raise ValueError(
+                    "malformed_score_line:"
+                    + line[:100]
+                )
+
+            # Harmless extra text in the score block should not cause a
+            # technical failure unless it replaces a required criterion.
+            continue
+
+        raw_name = match.group("name").strip()
+        canonical_name = _criterion_name(raw_name)
+
+        if canonical_name is None:
+            # It may be a total-like or unrelated line.
+            continue
+
+        if canonical_name in parsed:
+            raise ValueError(
+                f"duplicate_criterion:{canonical_name}"
+            )
+
+        score = Decimal(match.group("score"))
+
+        if score not in ALLOWED_SCORES:
+            raise ValueError(
+                f"invalid_criterion_score:"
+                f"{canonical_name}:{score}"
+            )
+
+        parsed[canonical_name] = score
+
+    missing = [
+        name
+        for name in CRITERIA
+        if name not in parsed
     ]
 
-    # Python calculates the authoritative total.
-    total = sum(scores)
+    if missing:
+        raise ValueError(
+            "missing_criteria:"
+            + ",".join(missing)
+        )
 
-    # IMPORTANT:
-    # We intentionally ignore:
-    #
-    # match[13] -> model-generated /24 total
-    # match[14] -> model-generated /75 total
-    #
-    # They may be wrong even when all 12 criterion scores
-    # are valid. We recalculate both deterministically.
+    if len(parsed) != 12:
+        raise ValueError(
+            f"wrong_criterion_count:{len(parsed)}"
+        )
 
-    recommendations = match[15].strip()
-    conclusion = match[16].strip()
+    return parsed
 
-    # ---------------------------------------------------------
-    # RECOMMENDATION VALIDATION
-    # ---------------------------------------------------------
 
-    items = re.findall(
-        r"(?m)^(\d+)\.\s+",
+def _validate_recommendations(
+    recommendations: str,
+    conclusion: str,
+) -> None:
+    """Validate useful structural requirements while tolerating 1. vs 1)."""
+    item_numbers = re.findall(
+        r"(?m)^\s*([1-5])[\.\)]\s+",
         recommendations,
     )
 
-    if items != ["1", "2", "3", "4", "5"]:
-        raise ValueError("Exactly five recommendations required")
+    if item_numbers != ["1", "2", "3", "4", "5"]:
+        raise ValueError(
+            "invalid_recommendation_numbers:"
+            + ",".join(item_numbers)
+        )
 
-    if "Qisqasi, maslahatim" not in conclusion:
-        raise ValueError("Required teacher closing missing")
-
-    recommendation_parts = re.split(
-        r"(?m)^\d+\.\s+",
+    parts = re.split(
+        r"(?m)^\s*[1-5][\.\)]\s+",
         recommendations,
     )[1:]
 
-    if any(
-        not part.strip()
-        for part in recommendation_parts
-    ):
-        raise ValueError("Empty recommendation")
+    if len(parts) != 5:
+        raise ValueError(
+            f"wrong_recommendation_count:{len(parts)}"
+        )
 
-    # ---------------------------------------------------------
-    # FORBIDDEN EXTRA SECTIONS
-    # ---------------------------------------------------------
+    if any(not part.strip() for part in parts):
+        raise ValueError("empty_recommendation")
+
+    if "Qisqasi, maslahatim" not in conclusion:
+        raise ValueError(
+            "required_teacher_closing_missing"
+        )
 
     forbidden_sections = (
         "BAHOLASH NATIJALARI:",
         "STOP NATIJA:",
         "Kirish qismi:",
         "Asosiy qism:",
+        "Xulosa:",
         "Imlo:",
         "Punktuatsiya:",
         "MATN BO‘YICHA IZOHLAR",
     )
 
-    feedback_text = recommendations + conclusion
+    feedback = recommendations + "\n" + conclusion
 
-    if any(
-        section in feedback_text
-        for section in forbidden_sections
-    ):
-        raise ValueError("Unexpected extra section")
+    for section in forbidden_sections:
+        if section in feedback:
+            raise ValueError(
+                f"unexpected_extra_section:{section}"
+            )
+
+
+def validate_result(text: str, essay: str) -> str:
+    """Validate, normalize and rebuild one essay result."""
+    text = _clean_model_text(text)
+
+    _validate_intro(text)
+
+    if "MATN BO‘YICHA IZOHLAR" in text:
+        raise ValueError(
+            "forbidden_matn_boyicha_izohlar"
+        )
 
     # ---------------------------------------------------------
-    # REBUILD FINAL AUTHORITATIVE RESULT
+    # STOP CASE
+    # ---------------------------------------------------------
+
+    stop_result = _parse_stop(text)
+
+    if stop_result is not None:
+        return stop_result
+
+    # ---------------------------------------------------------
+    # LOCAL WORD-COUNT SAFETY
+    # ---------------------------------------------------------
+
+    word_count = len(essay.split())
+
+    if word_count < 100:
+        raise ValueError(
+            f"short_essay_without_stop:{word_count}"
+        )
+
+    # ---------------------------------------------------------
+    # FIND NORMAL RESULT SECTIONS
+    # ---------------------------------------------------------
+
+    score_heading = "BAHOLASH NATIJALARI:"
+
+    score_pos = text.find(score_heading)
+    rec_pos = text.find(RECOMMENDATIONS)
+    conclusion_pos = text.find(CONCLUSION)
+
+    if score_pos == -1:
+        raise ValueError(
+            "baholash_heading_missing"
+        )
+
+    if rec_pos == -1:
+        raise ValueError(
+            "recommendations_heading_missing"
+        )
+
+    if conclusion_pos == -1:
+        raise ValueError(
+            "conclusion_heading_missing"
+        )
+
+    if not (
+        score_pos
+        < rec_pos
+        < conclusion_pos
+    ):
+        raise ValueError(
+            "result_sections_wrong_order"
+        )
+
+    score_block = text[
+        score_pos + len(score_heading):
+        rec_pos
+    ].strip()
+
+    recommendations = text[
+        rec_pos + len(RECOMMENDATIONS):
+        conclusion_pos
+    ].strip()
+
+    conclusion = text[
+        conclusion_pos + len(CONCLUSION):
+    ].strip()
+
+    if not score_block:
+        raise ValueError(
+            "empty_score_block"
+        )
+
+    if not recommendations:
+        raise ValueError(
+            "empty_recommendations"
+        )
+
+    if not conclusion:
+        raise ValueError(
+            "empty_conclusion"
+        )
+
+    # ---------------------------------------------------------
+    # PARSE THE 12 AUTHORITATIVE CRITERION SCORES
+    # ---------------------------------------------------------
+
+    parsed_scores = _parse_scores(score_block)
+
+    scores = [
+        parsed_scores[name]
+        for name in CRITERIA
+    ]
+
+    # Python, not the model, calculates totals.
+    total = sum(
+        scores,
+        Decimal("0"),
+    )
+
+    if total < 0 or total > 24:
+        raise ValueError(
+            f"calculated_total_out_of_range:{total}"
+        )
+
+    # ---------------------------------------------------------
+    # FEEDBACK VALIDATION
+    # ---------------------------------------------------------
+
+    _validate_recommendations(
+        recommendations,
+        conclusion,
+    )
+
+    # ---------------------------------------------------------
+    # REBUILD CLEAN AUTHORITATIVE OUTPUT
     # ---------------------------------------------------------
 
     criteria_output = "\n\n".join(
         f"{name} — {score:g}"
-        for name, score in zip(CRITERIA, scores)
+        for name, score in zip(
+            CRITERIA,
+            scores,
+        )
     )
 
     return (
         INTRO
-        + "\n\nBAHOLASH NATIJALARI:\n\n"
+        + "\n\n"
+        + score_heading
+        + "\n\n"
         + criteria_output
         + "\n\n"
         + totals(total)
@@ -321,20 +586,15 @@ def split_result(
     text: str,
     limit: int = 3900,
 ) -> list[str]:
-    """
-    Split long Telegram results safely.
-
-    Prefer paragraph boundaries first,
-    then word boundaries.
-
-    Telegram limits are conservatively measured
-    using UTF-16 code units.
-    """
+    """Split a long result safely for Telegram."""
 
     def size(value: str) -> int:
-        return len(
-            value.encode("utf-16-le")
-        ) // 2
+        # Telegram's length behavior is safest when measured
+        # conservatively in UTF-16 code units.
+        return (
+            len(value.encode("utf-16-le"))
+            // 2
+        )
 
     parts: list[str] = []
     current = ""
@@ -358,15 +618,22 @@ def split_result(
             units = 0
 
             for char in paragraph:
-                char_size = size(char)
+                char_units = size(char)
 
-                if units + char_size > limit:
+                if (
+                    units + char_units
+                    > limit
+                ):
                     break
 
-                units += char_size
+                units += char_units
                 end += 1
 
-            # Prefer splitting at a nearby space.
+            if end <= 0:
+                raise ValueError(
+                    "unable_to_split_result"
+                )
+
             boundary = paragraph.rfind(
                 " ",
                 0,
@@ -376,9 +643,10 @@ def split_result(
             if boundary > end // 2:
                 end = boundary
 
-            parts.append(
-                paragraph[:end]
-            )
+            part = paragraph[:end].rstrip()
+
+            if part:
+                parts.append(part)
 
             paragraph = (
                 paragraph[end:]
