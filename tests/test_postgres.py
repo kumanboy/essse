@@ -159,8 +159,12 @@ async def test_storage_survives_new_instance(pool):
     assert (await restart.get_data(key))['topic']=='Saqlangan mavzu'
 
 
+def raw_update(uid,number,text):
+    return {'update_id':number,'message':{'message_id':number,'date':1700000000,'chat':{'id':uid,'type':'private'},'from':{'id':uid,'is_bot':False,'first_name':'Test'},'text':text}}
+
+
 def update(uid,number,text):
-    return Update.model_validate({'update_id':number,'message':{'message_id':number,'date':1700000000,'chat':{'id':uid,'type':'private'},'from':{'id':uid,'is_bot':False,'first_name':'Test'},'text':text}})
+    return Update.model_validate(raw_update(uid,number,text))
 
 
 def dispatcher(pool,bot,subscribed=True):
@@ -178,8 +182,9 @@ async def test_real_dispatch_fsm_inbox_duplicate_and_submission(pool):
     inbox=Inbox(pool,dispatcher(pool,bot),bot)
     for number,text in enumerate(['📝 Esse tekshirish','Mavzu','qisqa esse'],1):
         event=update(101,number,text)
-        await inbox.receive(event)
-        await inbox.receive(event)
+        raw=raw_update(101,number,text)
+        await inbox.receive(event,raw)
+        await inbox.receive(event,raw)
         assert await inbox.process_one()
         assert not await inbox.process_one()
     assert await pool.fetchval('SELECT count(*) FROM essay_jobs')==1
@@ -193,7 +198,7 @@ async def test_no_subscription_no_job(pool):
     bot=Bot('123456:TEST_TOKEN_FOR_OFFLINE_TESTS')
     bot.session.make_request=AsyncMock(return_value=True)
     inbox=Inbox(pool,dispatcher(pool,bot,False),bot)
-    await inbox.receive(update(101,1,'📝 Esse tekshirish'))
+    await inbox.receive(update(101,1,'📝 Esse tekshirish'),raw_update(101,1,'📝 Esse tekshirish'))
     await inbox.process_one()
     assert await pool.fetchval('SELECT count(*) FROM essay_jobs')==0
     assert await pool.fetchval('SELECT count(*) FROM fsm_state')==0
@@ -204,11 +209,12 @@ async def test_forged_admin_callback_and_command(pool):
     bot=Bot('123456:TEST_TOKEN_FOR_OFFLINE_TESTS')
     bot.session.make_request=AsyncMock(return_value=True)
     inbox=Inbox(pool,dispatcher(pool,bot),bot)
-    await inbox.receive(update(101,1,'/admin'))
+    await inbox.receive(update(101,1,'/admin'),raw_update(101,1,'/admin'))
     await inbox.process_one()
     assert bot.session.make_request.call_count==0
-    event=Update.model_validate({'update_id':2,'callback_query':{'id':'abc','from':{'id':101,'is_bot':False,'first_name':'Test'},'chat_instance':'abc','data':'admin:off','message':{'message_id':1,'date':1700000000,'chat':{'id':101,'type':'private'},'text':'fake'}}})
-    await inbox.receive(event)
+    raw={'update_id':2,'callback_query':{'id':'abc','from':{'id':101,'is_bot':False,'first_name':'Test'},'chat_instance':'abc','data':'admin:off','message':{'message_id':1,'date':1700000000,'chat':{'id':101,'type':'private'},'text':'fake'}}}
+    event=Update.model_validate(raw)
+    await inbox.receive(event,raw)
     await inbox.process_one()
     assert await pool.fetchval('SELECT bot_enabled FROM bot_settings')
     assert await pool.fetchval('SELECT updated_by FROM bot_settings') is None

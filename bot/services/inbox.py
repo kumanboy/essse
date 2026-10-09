@@ -11,7 +11,7 @@ class Inbox:
     def __init__(self, pool, dispatcher, bot):
         self.pool, self.dispatcher, self.bot = pool, dispatcher, bot
 
-    async def receive(self, update: Update):
+    async def receive(self, update: Update, raw_update: dict):
         event = update.message or update.callback_query
         if event is None or event.from_user is None:
             return
@@ -20,7 +20,8 @@ class Inbox:
             return
         await self.pool.execute("""INSERT INTO telegram_updates(update_id,user_id,payload)
             VALUES($1,$2,$3::jsonb) ON CONFLICT DO NOTHING""",
-            update.update_id, event.from_user.id, update.model_dump_json(exclude_none=True))
+            update.update_id, event.from_user.id,
+            json.dumps(raw_update, ensure_ascii=False))
         log.debug("webhook_received update=%s", update.update_id)
 
     async def process_one(self):
@@ -40,7 +41,9 @@ class Inbox:
                 update_id = row["update_id"]
                 token = fsm_connection.set(conn)
                 try:
-                    update = Update.model_validate(json.loads(row["payload"]))
+                    # Bind the bot during validation, so aiogram's dispatcher
+                    # does not re-serialize the Update to mount bot context.
+                    update = Update.model_validate(json.loads(row["payload"]), context={"bot": self.bot})
                     async with asyncio.timeout(60):
                         await self.dispatcher.feed_update(self.bot, update)
                     await conn.execute("UPDATE telegram_updates SET status='done',payload=NULL WHERE update_id=$1", update_id)

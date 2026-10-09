@@ -92,10 +92,13 @@ def create_app():
             if len(body) > 262144:
                 raise HTTPException(413, "Update too large")
         try:
-            update = Update.model_validate(json.loads(body))
+            # Preserve the Telegram wire payload. aiogram's parsed Update may
+            # contain internal Default sentinels which Pydantic cannot JSON-dump.
+            raw_update = json.loads(body)
+            update = Update.model_validate(raw_update)
         except (ValidationError, ValueError, UnicodeError):
             raise HTTPException(400, "Invalid update") from None
-        await app.state.inbox.receive(update)  # Commit before HTTP acknowledgment.
+        await app.state.inbox.receive(update, raw_update)  # Commit before HTTP acknowledgment.
         app.state.workers.wakeup.set()
         return {"ok": True}
 
